@@ -27,7 +27,7 @@ $recordLength      = 1000;
 
 #zoek besluiten, return json object
 $updateDate             = date("d-m-Y",strtotime("-1 days")); //cron job runs at 00:15 am, so get yesterday's decisions
-//$updateDate             = "12-04-2016";
+$updateDate             = "13-04-2016";
 
 $uri = $sourceUrl . "do/search/ajax?searchText=&yearNumber=&organId=&title=&meetingDate=" . $updateDate . "&draw=1&columns[0][data]=function&columns[0][name]=&columns[0][searchable]=false&columns[0][orderable]=false&columns[0][search][value]=&columns[0][search][regex]=false&columns[1][data]=function&columns[1][name]=&columns[1][searchable]=false&columns[1][orderable]=false&columns[1][search][value]=&columns[1][search][regex]=false&columns[2][data]=function&columns[2][name]=&columns[2][searchable]=true&columns[2][orderable]=false&columns[2][search][value]=&columns[2][search][regex]=false&columns[3][data]=function&columns[3][name]=&columns[3][searchable]=true&columns[3][orderable]=false&columns[3][search][value]=&columns[3][search][regex]=false&columns[4][data]=function&columns[4][name]=&columns[4][searchable]=true&columns[4][orderable]=false&columns[4][search][value]=&columns[4][search][regex]=false&columns[5][data]=function&columns[5][name]=&columns[5][searchable]=true&columns[5][orderable]=false&columns[5][search][value]=&columns[5][search][regex]=false&start=" . $recordStart . "&length=" . $recordLength . "&search[value]=&search[regex]=false&_=";
 
@@ -37,31 +37,28 @@ $response = \Httpful\Request::get($uri)
     ->expectsJson()
     ->send();
 
-//var_dump($response);
+$recordsTotal       = $response->body->recordsTotal;
+$recordsFiltered    = $response->body->recordsFiltered;
+$errorCode          = $response->body->error;
+$recordsToUpdate    = count($response->body->data); 
 
-$recordsFound       = $response->body->recordsTotal;
-$recordsFiltered    = $response->body->recordsTotal;
-$statusCode         = $response->body->error;
-$log .= "API status from (" . $sourceUrl . "): " . $statusCode . "\n";
-
-if ($statusCode == '') { //zero means were OK
-
+if (!$errorCode ==null) {
+    $log .= "API error from (" . $sourceUrl . "): " . $errorCode . ", import was skipped\n";
+} 
+else { 
    /* create a prepared statement */
    $stmtDocuments     = $mysqli->prepare("INSERT INTO documents (src_id, content_pub, meetitem_src_id, meetitem_title_off,meetitem_title_pop, meetitem_meetdate, group_id, src_name, url, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,?)");
-   
    $stmtExistGroup    = $mysqli->prepare("SELECT id FROM groups WHERE src_id=?");
    $stmtNewGroup      = $mysqli->prepare("INSERT INTO groups (src_id, name, short_name) VALUES (?, ? , ?)");
    
    /* bind parameters for markers */
    $stmtDocuments->bind_param('sissssisss', $sourceId, $contentPublished, $meetingItemSourceId, $meetingItemTitleOff, $meetingItemTitlePop, $meetingItemMeetingDate, $groupId, $sourceName, $url, $summary);   
-   
-   /* bind parameters for markers */
-    $stmtExistGroup->bind_param("i", $groupSourceId);
-    $stmtNewGroup->bind_param('iss', $groupSourceId, $groupName, $groupShortName); 
+   $stmtExistGroup->bind_param("i", $groupSourceId);
+   $stmtNewGroup->bind_param('iss', $groupSourceId, $groupName, $groupShortName); 
   
     /* set parameters and execute */
    
-    while ($i < $recordsFound) {
+    while ($i < $recordsToUpdate) {
         if (isset($response->body->data[$i]->meeting->id)) { //docu needed -> what is this?
             $log .= "record id " . $response->body->data[$i]->id . " seems invalid and was not inserted \n";
         } 
@@ -78,6 +75,21 @@ if ($statusCode == '') { //zero means were OK
             $url                                = $sourceUrl . "do/publication/" . $sourceId . "/inline"; 
             $summary                            = "Geen samenvatting beschikbaar";
             
+            //if this group exists, get its id from db , else make new group
+            $stmtExistGroup->execute();
+            $stmtExistGroup->store_result(); //if we want to do ->num_rows we need to store results first 
+            
+            if ( !$stmtExistGroup->num_rows ==0 ) { //group exits
+                $stmtExistGroup->bind_result($existingGroupId);
+                if ( $stmtExistGroup->fetch() ) {
+                    $groupId = $existingGroupId;
+                }
+            } else {
+                $stmtNewGroup->execute();
+                $groupId = $stmtNewGroup->insert_id;
+                $log .= "Created new group " . $groupName . "(id: " . $groupId . ") \n";
+            }
+            
             # condition some values for db 
             ( $contentPublished == true ? $contentPublished = 1: $contentPublished = 0 );
             //cleanup the official title, split off first part (e.g. 2016_MV_00157 - Mondelinge vraag van raa...)
@@ -93,21 +105,6 @@ if ($statusCode == '') { //zero means were OK
             
             //var_dump(get_defined_vars());
             ( $stmtDocuments->execute() ? $recInserted++: $log .= "record id " . $response->body->data[$i]->id . " could not be inserted \n") ;
-            
-            //if this group exists, get its id from db , else make new group
-            $stmtExistGroup->execute();
-            $stmtExistGroup->store_result(); //if we want to do ->num_rows we need to store results first 
-            
-            if ( !$stmtExistGroup->num_rows ==0 ) {
-                $stmtExistGroup->bind_result($existingGroupId);
-                if ( $stmtExistGroup->fetch() ) {
-                    $groupId = $existingGroupId;
-                }
-            } else {
-                $stmtNewGroup->execute();
-                $groupId = $stmtNewGroup->insert_id;
-                $log .= "Created new group " . $groupName . "(id: " . $groupId . ") \n";
-            }
    
         }
         
@@ -115,7 +112,7 @@ if ($statusCode == '') { //zero means were OK
    }
 }
                 
-$log .= " -Script retrieved records for " . $updateDate . "\n -Found " . $recordsFound . " records and filtered " . $recordsFiltered . "\n -Inserted " . $recInserted . " records successfully" ;
+$log .= " -Script retrieved records for " . $updateDate . "\n -Found " . $recordsTotal . " records and filtered " . $recordsFiltered . "\n -Inserted " . $recInserted . " records successfully" ;
 
 writeLog($log);
 echo $log;
